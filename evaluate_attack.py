@@ -152,7 +152,7 @@ def parse_eth3d_points3d_txt(points3d_txt: Path,
 
     Each non-comment line: `POINT3D_ID X Y Z R G B ERROR (IMAGE_ID POINT2D_IDX)*`.
     If `allowed_image_ids` is given, keep only points whose track intersects
-    it — i.e., points that are seen by at least one of our selected images.
+    it (i.e., points seen by at least one of our selected images).
     That filter is the ETH3D analog of DTU's ObsMask (it removes GT geometry
     no view in the attack actually sees, so completeness is not penalised by
     parts of the scene outside every camera frustum).
@@ -289,7 +289,7 @@ def icp_with_scale(pred: np.ndarray,
     [s_init / scale_drift_max, s_init * scale_drift_max].  Without this, an
     adversarially corrupted pred cloud (which has no consistent rotation+
     scale to GT) can drag Umeyama into a degenerate s→0 solution that maps
-    every pred point onto the GT centroid — yielding a misleadingly small
+    every pred point onto the GT centroid, yielding a misleadingly small
     capped RMSE.  The PCA-derived `s_init` is a strong physical prior on the
     overall pred-vs-GT scale ratio; an order of magnitude either side is
     plenty of slack for healthy fits while still catching collapses.
@@ -422,12 +422,12 @@ def chamfer_metrics_simple(pred: np.ndarray,
                            max_dist: float,
                            taus: Tuple[float, ...] = (0.01, 0.02, 0.05),
                            ) -> dict:
-    """Chamfer metrics without ObsMask/Plane filtering — for ETH3D, where the
-    visibility filter has already been applied to `gt` upstream.
+    """Chamfer metrics without ObsMask/Plane filtering (for ETH3D, where the
+    visibility filter has already been applied to `gt` upstream).
 
     Returns Acc/Comp/Overall in whatever distance units pred and gt share, plus
     F-scores at the supplied thresholds (ETH3D's published metric is the
-    F-score at τ — defaults 1/2/5 cm match the public benchmark).
+    F-score at tau; defaults 1/2/5 cm match the public benchmark).
     """
     pred_ds = voxel_downsample(pred, voxel)
     gt_ds = voxel_downsample(gt, voxel)
@@ -498,9 +498,9 @@ def evaluate(pred_npz: Path,
     if len(pred) < 1000:
         raise RuntimeError(
             f"Only {len(pred)} predicted points survived conf_thresh={conf_thresh}; "
-            f"the attack may have crushed all confidence — try a lower threshold.")
+            f"the attack may have crushed all confidence; try a lower threshold.")
 
-    # Random-subsample for ICP — full alignment over 3M GT points and 1.6M
+    # Random-subsample for ICP; full alignment over 3M GT points and 1.6M
     # pred points is unnecessary and slow.  We use the full clouds for the
     # final metric.
     sub_p = pred if len(pred) <= align_subsample else pred[
@@ -573,7 +573,7 @@ def evaluate_eth3d(pred_npz: Path,
     if len(pred) < 1000:
         raise RuntimeError(
             f"Only {len(pred)} predicted points survived conf_thresh={conf_thresh}; "
-            f"the attack may have crushed all confidence — try a lower threshold.")
+            f"the attack may have crushed all confidence; try a lower threshold.")
     if len(gt_vis) < 100:
         raise RuntimeError(
             f"Only {len(gt_vis)} GT points fall in the tracks of the selected "
