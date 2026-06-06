@@ -121,41 +121,10 @@ def load_plane(mat_path: Path) -> np.ndarray:
 # ETH3D ground truth (COLMAP-format SfM reconstruction)
 # ---------------------------------------------------------------------------
 
-def parse_eth3d_images_txt(images_txt: Path) -> dict:
-    """Parse COLMAP `images.txt` → {image_relative_name: IMAGE_ID}.
-
-    File layout (per image, two lines):
-      IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
-      POINTS2D[] as (X, Y, POINT3D_ID) triplets
-
-    We skip comments and read non-comment lines in pairs; only the first line
-    of each pair is informative (the POINTS2D line is ignored).
-    """
-    out = {}
-    with open(images_txt) as f:
-        lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
-    # Even-indexed lines are headers, odd-indexed are POINTS2D lists.
-    for i in range(0, len(lines), 2):
-        parts = lines[i].split()
-        if len(parts) < 10:
-            continue
-        image_id = int(parts[0])
-        name = parts[9]
-        out[name] = image_id
-    return out
-
-
-def parse_eth3d_points3d_txt(points3d_txt: Path,
-                             allowed_image_ids: Optional[set] = None
-                             ) -> np.ndarray:
-    """Parse COLMAP `points3D.txt` → (N, 3) point cloud.
+def parse_eth3d_points3d_txt(points3d_txt: Path) -> np.ndarray:
+    """Parse COLMAP `points3D.txt` to an (N, 3) point cloud.
 
     Each non-comment line: `POINT3D_ID X Y Z R G B ERROR (IMAGE_ID POINT2D_IDX)*`.
-    If `allowed_image_ids` is given, keep only points whose track intersects
-    it (i.e., points seen by at least one of our selected images).
-    That filter is the ETH3D analog of DTU's ObsMask (it removes GT geometry
-    no view in the attack actually sees, so completeness is not penalised by
-    parts of the scene outside every camera frustum).
     """
     pts = []
     with open(points3d_txt) as f:
@@ -166,39 +135,17 @@ def parse_eth3d_points3d_txt(points3d_txt: Path,
             parts = line.split()
             if len(parts) < 8:
                 continue
-            xyz = (float(parts[1]), float(parts[2]), float(parts[3]))
-            if allowed_image_ids is not None:
-                # Track starts at index 8: alternating (IMAGE_ID, POINT2D_IDX).
-                track_ids = (int(parts[k]) for k in range(8, len(parts), 2))
-                if not any(t in allowed_image_ids for t in track_ids):
-                    continue
-            pts.append(xyz)
+            pts.append((float(parts[1]), float(parts[2]), float(parts[3])))
     return np.asarray(pts, dtype=np.float32)
 
 
 def load_eth3d_gt(scene_dir: Path,
-                  image_rel_paths: list,
                   calib_subdir: str = "dslr_calibration_undistorted"
-                  ) -> Tuple[np.ndarray, np.ndarray, set]:
-    """Return (gt_visible, gt_all, allowed_ids) for an ETH3D scene.
-
-    `gt_visible` is the SfM point cloud filtered to points whose track contains
-    at least one of `image_rel_paths`; `gt_all` is the full SfM cloud (used
-    only for the ICP alignment, where more reference points help).
-    """
+                  ) -> np.ndarray:
+    """Return the full ETH3D SfM ground-truth point cloud for a scene."""
     calib = Path(scene_dir) / calib_subdir
-    images_txt = calib / "images.txt"
     points3d_txt = calib / "points3D.txt"
-    name_to_id = parse_eth3d_images_txt(images_txt)
-    missing = [p for p in image_rel_paths if p not in name_to_id]
-    if missing:
-        raise RuntimeError(
-            f"Image paths not found in {images_txt}: {missing[:3]}…"
-        )
-    allowed_ids = {name_to_id[p] for p in image_rel_paths}
-    gt_visible = parse_eth3d_points3d_txt(points3d_txt, allowed_ids)
-    gt_all = parse_eth3d_points3d_txt(points3d_txt, None)
-    return gt_visible, gt_all, allowed_ids
+    return parse_eth3d_points3d_txt(points3d_txt)
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +369,8 @@ def chamfer_metrics_simple(pred: np.ndarray,
                            max_dist: float,
                            taus: Tuple[float, ...] = (0.01, 0.02, 0.05),
                            ) -> dict:
-    """Chamfer metrics without ObsMask/Plane filtering (for ETH3D, where the
-    visibility filter has already been applied to `gt` upstream).
+    """Chamfer metrics without ObsMask/Plane filtering (for ETH3D, which has no
+    such mask).
 
     Returns Acc/Comp/Overall in whatever distance units pred and gt share, plus
     F-scores at the supplied thresholds (ETH3D's published metric is the
@@ -566,24 +513,19 @@ def evaluate_eth3d(pred_npz: Path,
         image_rel_paths = [str(s) for s in d["image_rel_paths"].tolist()]
         npz_scene_dir = Path(str(d["scene_dir"]))
     scene_dir = Path(scene_dir) if scene_dir is not None else npz_scene_dir
-    gt_vis, gt_full, allowed_ids = load_eth3d_gt(scene_dir, image_rel_paths)
+    gt = load_eth3d_gt(scene_dir)
     if verbose:
-        print(f"loaded pred={len(pred):,}  gt_visible={len(gt_vis):,}/"
-              f"{len(gt_full):,}  ({time.time()-t0:.1f}s)")
+        print(f"loaded pred={len(pred):,}  gt={len(gt):,}  "
+              f"({time.time()-t0:.1f}s)")
     if len(pred) < 1000:
         raise RuntimeError(
             f"Only {len(pred)} predicted points survived conf_thresh={conf_thresh}; "
             f"the attack may have crushed all confidence; try a lower threshold.")
-    if len(gt_vis) < 100:
-        raise RuntimeError(
-            f"Only {len(gt_vis)} GT points fall in the tracks of the selected "
-            f"images. Check that image_rel_paths match images.txt entries.")
 
-    # Align pred → gt_visible. Aligning against gt_full pulls PCA toward the
-    # SfM far-outliers (sky/distant facades extend to ±100 m, while the
-    # courtyard footprint is ~20 m), which yields a poor rotation/scale.
-    # Also clip the predicted cloud to the per-axis 1-99 percentile range so
-    # the model's sky/edge artefacts don't bias PCA.
+    # Percentile-clip both clouds before the alignment subsample so that ETH3D
+    # SfM far-outliers (sky / distant facades extending to +-100 m, vs a ~20 m
+    # courtyard footprint) and the predicted cloud's edge artefacts do not bias
+    # PCA. The final Chamfer is computed against the unclipped full GT.
     def _percentile_clip(p: np.ndarray, lo: float = 1.0, hi: float = 99.0) -> np.ndarray:
         bounds = np.stack([np.percentile(p, lo, axis=0),
                            np.percentile(p, hi, axis=0)], axis=0)
@@ -591,10 +533,11 @@ def evaluate_eth3d(pred_npz: Path,
         return p[m]
 
     pred_align = _percentile_clip(pred)
+    gt_align = _percentile_clip(gt)
     sub_p = pred_align if len(pred_align) <= align_subsample else pred_align[
         rng.choice(len(pred_align), size=align_subsample, replace=False)]
-    sub_g = gt_vis if len(gt_vis) <= align_subsample else gt_vis[
-        rng.choice(len(gt_vis), size=align_subsample, replace=False)]
+    sub_g = gt_align if len(gt_align) <= align_subsample else gt_align[
+        rng.choice(len(gt_align), size=align_subsample, replace=False)]
 
     t1 = time.time()
     s, R, t, align_score = icp_with_scale(sub_p, sub_g, verbose=verbose)
@@ -605,7 +548,7 @@ def evaluate_eth3d(pred_npz: Path,
     pred_m = apply_sim(pred, s, R, t)
 
     t2 = time.time()
-    metrics = chamfer_metrics_simple(pred_m, gt_vis,
+    metrics = chamfer_metrics_simple(pred_m, gt,
                                      voxel=voxel, max_dist=max_dist)
     if verbose:
         print(f"metrics: acc={metrics['accuracy']:.4f}m  "
@@ -633,11 +576,11 @@ def evaluate_eth3d(pred_npz: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eth3d", action="store_true",
-                    help="Use ETH3D evaluation mode (COLMAP SfM ground truth, "
-                         "track-visibility filter, metres-scale defaults). "
-                         "When set, --gt/--obsmask/--plane are not required; "
-                         "the scene directory is read from the npz unless "
-                         "--scene-dir overrides it.")
+                    help="Use ETH3D evaluation mode (full COLMAP SfM ground "
+                         "truth, metres-scale defaults). When set, "
+                         "--gt/--obsmask/--plane are not required; the scene "
+                         "directory is read from the npz unless --scene-dir "
+                         "overrides it.")
     ap.add_argument("--pred", required=True, type=Path,
                     help="Path to a saved .npz from the attack notebook "
                          "(e.g. output/clean_depth/clean_depth.npz).")
